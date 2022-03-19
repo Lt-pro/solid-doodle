@@ -1,0 +1,157 @@
+"""
+一、Dataset与DataLoader
+    torch提供的帮助处理数据的2个类型，Dataset可以看作数据的容器，它还是torch中其它数据集类型的基类，一般通过定义相应的子类来使用，子类中需要
+预定义__init__、__getitem__、__len__三个方法，然后生成实例传给DataLoader。DataLoader提供了一些常见的数据处理比如数据混洗以及加速策略，
+DataLoader的实例是一个可迭代对象，每次迭代输出一个batch的__getitem__方法返回的Tensor或Tensor的元组。
+    1、Dataset与DataLoader使用示例
+        import numpy as np
+        import torch
+        from torch.utils.data import Dataset, DataLoader
+        
+        class sinDataset(Dataset):
+            def __init__(self, X, y):
+                self.X = X
+                self.y = y
+                
+                self.X = torch.FloatTensor(self.X)
+                self.y = torch.FloatTensor(self.y)
+            
+            #返回一个训练样本
+            #注意输入与输出类型要与模型相匹配
+            #Regression 
+            #inputs:FloatTensor, shape=(batch, **)   **表示一个样本数据的形状
+            #outputs: FloatTensor, shape=(batch, **)
+            #Classification
+            #inputs: FloatTensor, shape=(batch, **)
+            #outputs: FloatTensor, shape=(batch, num_classes)
+            #labels: LongTensor, shape=(batch, **)
+            def __getitem__(self, idx):
+                return self.X[idx], self.y[idx]
+                
+            #数据集的大小
+            def __len__(self):
+                return len(self.X)
+        
+        X = np.linspace(0, 2*np.pi, 1e4, endpoint=False)
+        y = np.sin(self.X)
+        dataset = sinDataset(X, y)
+        
+        def collate_batch(batch):
+            return batch
+            
+        loader = DataLoader(
+            dataset,                      #数据集
+            batch_size = 32,              #batch_size
+            shuffle = True,               #是否混洗数据集,测试时无需混洗
+            drop_last = True,             #是否丢失最后一个batch，可能不足batch_size数目
+            num_workers = 0,              #加载数据集的子进程数目，Windows系统无法使用此功能
+            pin_memory = True,            #锁页内存,只使用物理内存不使用虚拟内存，物理内存足够大时可用来加快速度
+            collate_fn = collate_batch    #处理一个batch的数据集，比如pad_sequence
+        )
+    2、DataLoader使用示例
+        import torch
+        from torch import nn
+        from torch.optim import Adam
+        
+        class Regressor(nn.Module):
+            def __init__(self):
+                self.linear1 = nn.Linear(1, 32)
+                self.linear2 = nn.Linear(32, 1)
+                self.act_fn = nn.Sigmoid()
+                
+            def forward(self, x):
+                x = self.linear1(x)
+                x = self.act_fn(x)
+                return self.linear2(x)
+        
+        #注意数据计算使用的设备以及相应的转换操作
+        #将模型、数据加入使用的设备： xx.to(device)
+        #将数据拷贝到CPU： xx.cpu()
+        #将零维张量变为浮点数：xx.item()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        
+        model = Regressor()
+        model.to(device)
+        criterion = nn.MSELoss()
+        optimizer = Adam(model.parameters(), lr=1e-3)
+        
+        n_epochs = 20
+        train_loss = []
+        
+        model.train()
+        for i in range(n_epochs):
+            #此处是监督学习过程，loader每次迭代的是一个包含数据与标签的元组
+            for X, y in loader:
+                X, y = X.to(device), y.to(device)
+                
+                y_pred = model(X)
+                loss = criterion(y_pred, y)
+                
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                
+                train_loss.append(loss.cpu().item())
+                
+                
+二、热启动
+    一种除了梯度下降外进行训练模型的一种策略，它通过改变学习率来提升梯度下降的效果，称为学习率调度。torch提供LambdaLR、AdamW实现带热启动
+的Adam算法。下面介绍按余弦规律变化调度的实例
+    import math
+    import torch
+    from torch import nn
+    from torch.optim import AdamW, Optimizer
+    from torch.optim.lr_scheduler import LambdaLR
+    
+    #根据指定参数生成一个调度器实例
+    def get_cosine_schedule_with_warmup(
+        optimizer: Optimizer,
+        num_warm_steps: int,          #热启动步数
+        num_train_steps: int,         #总训练步数
+        num_cycles: float=0.5,
+        last_epoch: int=-1,
+    ):
+        def lr_lambda(current_step):
+            if current_step <= num_warm_steps:
+                return float(current_step)/num_warm_steps
+            else:
+                percent = float(current_step - num_warm_steps)/max(0.5, num_train_steps - num_warm_steps)
+                return 0.5 * (1 + math.cos(2*math.pi*num_cycles*percent))
+        
+        #LambdaLR一般需要指定optimizer、lambda_lr、last_epoch三个参数
+        #optimizer：调度的优化器，要求支持热启动
+        #lambda_lr： lambda实例或者其列表，具体调度的算法函数
+        #last_epoch: 默认值为-1
+        return LambdaLR(optimizer, lr_lambda, last_epoch)
+    
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    model = Regressor()
+    model.to(device)
+    criterion = nn.MSELoss()
+    
+    optimizer = AdamW(model.parameters(), lr=1e-3)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer, 
+        num_warm_steps = 2000,
+        num_train_steps = 70000
+        )
+    
+    num_epochs = 20
+    train_loss = []
+    model.train()
+    for i in range(num_epochs):
+        for batch in loader:
+            X, y = batch
+            X, y = X.to(device), y.to(device)
+            
+            y_pred = model(X)
+            loss = criterion(y_pred, y)
+            
+            optimizer.zero_grad()
+            loss.backward()
+            optmizer.step()
+            scheduler.step()
+            
+            train_loss.append(loss.cpu().item)
+        
